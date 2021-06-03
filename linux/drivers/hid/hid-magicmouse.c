@@ -17,8 +17,10 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+#include <linux/usb/input.h>
 
 #include "hid-ids.h"
+#include "usbhid/usbhid.h"
 
 static bool emulate_3button = true;
 module_param(emulate_3button, bool, 0644);
@@ -50,6 +52,18 @@ MODULE_PARM_DESC(scroll_acceleration, "Accelerate sequential scroll events");
 static bool report_undeciphered;
 module_param(report_undeciphered, bool, 0644);
 MODULE_PARM_DESC(report_undeciphered, "Report undeciphered multi-touch state field using a MSC_RAW event");
+
+static bool host_click = false;
+module_param(host_click, bool, 0644);
+MODULE_PARM_DESC(host_click, "Host click mode");
+
+static unsigned int button_down_param = 0x40170606;
+module_param(button_down_param, uint, 0644);
+MODULE_PARM_DESC(button_down_param, "pressure when button_down and how to vibration");
+
+static unsigned int button_up_param = 0x26140000;
+module_param(button_up_param, uint, 0644);
+MODULE_PARM_DESC(button_up_param, "pressure when button_up and how to vibration");
 
 #define TRACKPAD_REPORT_ID 0x28
 #define TRACKPAD2_USB_REPORT_ID 0x02
@@ -102,6 +116,11 @@ MODULE_PARM_DESC(report_undeciphered, "Report undeciphered multi-touch state fie
 #define TRACKPAD2_MAX_Y 2587
 #define TRACKPAD2_RES_Y \
 	((TRACKPAD2_MAX_Y - TRACKPAD2_MIN_Y) / (TRACKPAD2_DIMENSION_Y / 100))
+
+static u8 pressure_down;
+static u8 pressure_up;
+static u8 vib_down[] = { 0xF2, 0x53, 0x01, 0x17, 0x78, 0x02, 0x06, 0x24, 0x30, 0x06, 0x01, 0x06, 0x18, 0x48, 0x12 };
+static u8 vib_up[] = { 0xF2, 0x53, 0x01, 0x14, 0x78, 0x02, 0x00, 0x24, 0x30, 0x06, 0x01, 0x00, 0x18, 0x48, 0x12 };
 
 /**
  * struct magicmouse_sc - Tracks Magic Mouse-specific data.
@@ -312,12 +331,20 @@ static void magicmouse_emit_touch(struct magicmouse_sc *msc, int raw_id, u8 *tda
 	}
 }
 
+static void magicmouse_sendint_callback(struct urb *urb)
+{
+	;
+}
 static int magicmouse_raw_event(struct hid_device *hdev,
 		struct hid_report *report, u8 *data, int size)
 {
 	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
 	struct input_dev *input = msc->input;
-	int x = 0, y = 0, ii, clicks = 0, npoints;
+	int x = 0, y = 0, ii, clicks = 0, npoints, bufsize;
+	static int clicks_prev = 0;
+	struct usb_device *udev;
+	struct urb *urb;
+	u8 *buf;
 
 	switch (data[0]) {
 	case TRACKPAD_REPORT_ID:
@@ -425,6 +452,55 @@ static int magicmouse_raw_event(struct hid_device *hdev,
 		break;
 	default:
 		return 0;
+	}
+
+	/* tell trackpad 2 to vibrate */
+	if (host_click && (data[0] == TRACKPAD2_BT_REPORT_ID)) {
+		clicks = 0;
+		for (ii = 0; ii < npoints; ii++)
+			if ((clicks_prev == 0 && data[size - 2 - 9 * ii] >= pressure_down) ||
+			    (clicks_prev == 1 && data[size - 2 - 9 * ii] >= pressure_up))
+				clicks = 1;
+		if (clicks_prev == 0 && clicks == 1)
+			hid_hw_output_report(hdev, vib_down, sizeof(vib_down));
+		else if (clicks_prev == 1 && clicks == 0)
+			hid_hw_output_report(hdev, vib_up, sizeof(vib_up));
+		clicks_prev = clicks;
+	} else if (host_click && (data[0] == TRACKPAD2_USB_REPORT_ID)) {
+		clicks = 0;
+		for (ii = 0; ii < npoints; ii++)
+			if ((clicks_prev == 0 && data[size - 2 - 9 * ii] >= pressure_down) ||
+			    (clicks_prev == 1 && data[size - 2 - 9 * ii] >= pressure_up))
+				clicks = 1;
+		udev = hid_to_usb_dev(hdev);
+		urb = usb_alloc_urb(0, GFP_KERNEL);
+		if (clicks_prev == 0 && clicks == 1) {
+			bufsize = sizeof(vib_down) - 1;
+			buf = kmemdup(vib_down + 1, bufsize, GFP_KERNEL);
+			usb_fill_int_urb(urb,
+				udev,
+				usb_sndintpipe(udev, 0x04),
+				buf,
+				bufsize,
+				magicmouse_sendint_callback,
+				hdev,
+				2);
+			usb_submit_urb(urb, GFP_KERNEL);
+		}
+		else if (clicks_prev == 1 && clicks == 0) {;
+			bufsize = sizeof(vib_up) - 1;
+			buf = kmemdup(vib_up + 1, bufsize, GFP_KERNEL);
+			usb_fill_int_urb(urb,
+				udev,
+				usb_sndintpipe(udev, 0x04),
+				buf,
+				bufsize,
+				magicmouse_sendint_callback,
+				hdev,
+				2);
+			usb_submit_urb(urb, GFP_KERNEL);
+		}
+		clicks_prev = clicks;
 	}
 
 	if (input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE ||
@@ -672,6 +748,50 @@ static int magicmouse_enable_multitouch(struct hid_device *hdev)
 	return ret;
 }
 
+static int magicmouse_enable_hostclick(struct hid_device *hdev)
+{
+	u8 feature[] = { 0xF2, 0x21, 0x01 };
+	u8 *buf;
+	int ret;
+	int feature_size;
+	struct usb_device *udev;
+
+	if (hdev->product != USB_DEVICE_ID_APPLE_MAGICTRACKPAD2) {
+		return 0;
+	}
+
+	feature[2] = (u8)host_click;
+	pressure_down = button_down_param >> 24;
+	pressure_up = button_up_param >> 24;
+	vib_down[3] = (u8)(button_down_param >> 16);
+	vib_down[6] = (u8)(button_down_param >> 8);
+	vib_down[11] = (u8)(button_down_param >> 0);
+	vib_up[3] = (u8)(button_up_param >> 16);
+	vib_up[6] = (u8)(button_up_param >> 8);
+	vib_up[11] = (u8)(button_up_param >> 0);
+
+	if (hdev->vendor == BT_VENDOR_ID_APPLE) {
+		feature_size = sizeof(feature);
+		buf = kmemdup(feature, feature_size, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
+		ret = hid_hw_raw_request(hdev, buf[0], buf, feature_size,
+					HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
+		kfree(buf);
+	} else { /* USB_VENDOR_ID_APPLE */
+		udev = hid_to_usb_dev(hdev);
+		feature_size = sizeof(feature) - 1;
+		buf = kmemdup(feature + 1, feature_size, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
+		ret = usb_control_msg(udev, usb_sndctrlpipe(udev, 0), 9, 0x21, 0x0321, 2, buf, feature_size,
+				USB_CTRL_SET_TIMEOUT);
+		kfree(buf);
+	}
+
+	return ret;
+}
+
 static void magicmouse_enable_mt_work(struct work_struct *work)
 {
 	struct magicmouse_sc *msc =
@@ -679,6 +799,9 @@ static void magicmouse_enable_mt_work(struct work_struct *work)
 	int ret;
 
 	ret = magicmouse_enable_multitouch(msc->hdev);
+	if (ret < 0)
+		hid_err(msc->hdev, "unable to request touch data (%d)\n", ret);
+	ret = magicmouse_enable_hostclick(msc->hdev);
 	if (ret < 0)
 		hid_err(msc->hdev, "unable to request touch data (%d)\n", ret);
 }
@@ -769,7 +892,11 @@ static int magicmouse_probe(struct hid_device *hdev,
 	if (ret == -EIO && id->product == USB_DEVICE_ID_APPLE_MAGICMOUSE2) {
 		schedule_delayed_work(&msc->work, msecs_to_jiffies(500));
 	}
-
+	ret = magicmouse_enable_hostclick(hdev);
+	if (ret != -EIO && ret < 0) {
+		hid_err(hdev, "unable to request touch data (%d)\n", ret);
+		goto err_stop_hw;
+	}
 	return 0;
 err_stop_hw:
 	hid_hw_stop(hdev);
