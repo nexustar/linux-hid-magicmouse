@@ -937,6 +937,9 @@ static struct hid_driver magicmouse_driver = {
 	.event = magicmouse_event,
 	.input_mapping = magicmouse_input_mapping,
 	.input_configured = magicmouse_input_configured,
+#ifdef CONFIG_PM
+	.resume = magicmouse_enable_hostclick
+#endif
 };
 module_hid_driver(magicmouse_driver);
 
