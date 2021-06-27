@@ -119,8 +119,6 @@ MODULE_PARM_DESC(button_up_param, "pressure when button_up and how to vibration"
 
 static u8 pressure_down;
 static u8 pressure_up;
-static u8 vib_down[] = { 0xF2, 0x53, 0x01, 0x17, 0x78, 0x02, 0x06, 0x24, 0x30, 0x06, 0x01, 0x06, 0x18, 0x48, 0x12 };
-static u8 vib_up[] = { 0xF2, 0x53, 0x01, 0x14, 0x78, 0x02, 0x00, 0x24, 0x30, 0x06, 0x01, 0x00, 0x18, 0x48, 0x12 };
 
 /**
  * struct magicmouse_sc - Tracks Magic Mouse-specific data.
@@ -151,6 +149,8 @@ struct magicmouse_sc {
 
 	struct hid_device *hdev;
 	struct delayed_work work;
+	u8 *vib_down;
+	u8 *vib_up;
 };
 
 static int magicmouse_firm_touch(struct magicmouse_sc *msc)
@@ -333,18 +333,18 @@ static void magicmouse_emit_touch(struct magicmouse_sc *msc, int raw_id, u8 *tda
 
 static void magicmouse_sendint_callback(struct urb *urb)
 {
-	;
+	if (urb)
+		usb_free_urb(urb);
 }
 static int magicmouse_raw_event(struct hid_device *hdev,
 		struct hid_report *report, u8 *data, int size)
 {
 	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
 	struct input_dev *input = msc->input;
-	int x = 0, y = 0, ii, clicks = 0, npoints, bufsize;
+	int x = 0, y = 0, ii, clicks = 0, npoints;
 	static int clicks_prev = 0;
 	struct usb_device *udev;
 	struct urb *urb;
-	u8 *buf;
 
 	switch (data[0]) {
 	case TRACKPAD_REPORT_ID:
@@ -462,9 +462,9 @@ static int magicmouse_raw_event(struct hid_device *hdev,
 			    (clicks_prev == 1 && data[size - 2 - 9 * ii] >= pressure_up))
 				clicks = 1;
 		if (clicks_prev == 0 && clicks == 1)
-			hid_hw_output_report(hdev, vib_down, sizeof(vib_down));
+			hid_hw_output_report(hdev, msc->vib_down, 15);
 		else if (clicks_prev == 1 && clicks == 0)
-			hid_hw_output_report(hdev, vib_up, sizeof(vib_up));
+			hid_hw_output_report(hdev, msc->vib_up, 15);
 		clicks_prev = clicks;
 	} else if (host_click && (data[0] == TRACKPAD2_USB_REPORT_ID)) {
 		clicks = 0;
@@ -475,26 +475,21 @@ static int magicmouse_raw_event(struct hid_device *hdev,
 		udev = hid_to_usb_dev(hdev);
 		urb = usb_alloc_urb(0, GFP_KERNEL);
 		if (clicks_prev == 0 && clicks == 1) {
-			bufsize = sizeof(vib_down) - 1;
-			buf = kmemdup(vib_down + 1, bufsize, GFP_KERNEL);
 			usb_fill_int_urb(urb,
 				udev,
 				usb_sndintpipe(udev, 0x04),
-				buf,
-				bufsize,
+				msc->vib_down,
+				14,
 				magicmouse_sendint_callback,
 				hdev,
 				2);
 			usb_submit_urb(urb, GFP_KERNEL);
-		}
-		else if (clicks_prev == 1 && clicks == 0) {;
-			bufsize = sizeof(vib_up) - 1;
-			buf = kmemdup(vib_up + 1, bufsize, GFP_KERNEL);
+		} else if (clicks_prev == 1 && clicks == 0) {
 			usb_fill_int_urb(urb,
 				udev,
 				usb_sndintpipe(udev, 0x04),
-				buf,
-				bufsize,
+				msc->vib_up,
+				14,
 				magicmouse_sendint_callback,
 				hdev,
 				2);
@@ -751,10 +746,13 @@ static int magicmouse_enable_multitouch(struct hid_device *hdev)
 static int magicmouse_enable_hostclick(struct hid_device *hdev)
 {
 	u8 feature[] = { 0xF2, 0x21, 0x01 };
+	u8 vib_down[] = { 0xF2, 0x53, 0x01, 0x17, 0x78, 0x02, 0x06, 0x24, 0x30, 0x06, 0x01, 0x06, 0x18, 0x48, 0x12 };
+	u8 vib_up[] = { 0xF2, 0x53, 0x01, 0x14, 0x78, 0x02, 0x00, 0x24, 0x30, 0x06, 0x01, 0x00, 0x18, 0x48, 0x12 };
 	u8 *buf;
 	int ret;
 	int feature_size;
 	struct usb_device *udev;
+	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
 
 	if (hdev->product != USB_DEVICE_ID_APPLE_MAGICTRACKPAD2) {
 		return 0;
@@ -778,6 +776,10 @@ static int magicmouse_enable_hostclick(struct hid_device *hdev)
 		ret = hid_hw_raw_request(hdev, buf[0], buf, feature_size,
 					HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
 		kfree(buf);
+		msc->vib_down = kmemdup(vib_down, 15, GFP_KERNEL);
+		msc->vib_up = kmemdup(vib_up, 15, GFP_KERNEL);
+		if (!msc->vib_down || !msc->vib_up)
+			return -ENOMEM;
 	} else { /* USB_VENDOR_ID_APPLE */
 		udev = hid_to_usb_dev(hdev);
 		feature_size = sizeof(feature) - 1;
@@ -787,6 +789,10 @@ static int magicmouse_enable_hostclick(struct hid_device *hdev)
 		ret = usb_control_msg(udev, usb_sndctrlpipe(udev, 0), 9, 0x21, 0x0321, 2, buf, feature_size,
 				USB_CTRL_SET_TIMEOUT);
 		kfree(buf);
+		msc->vib_down = kmemdup(vib_down + 1, 14, GFP_KERNEL);
+		msc->vib_up = kmemdup(vib_up + 1, 14, GFP_KERNEL);
+		if (!msc->vib_down || !msc->vib_up)
+			return -ENOMEM;
 	}
 
 	return ret;
@@ -907,8 +913,13 @@ static void magicmouse_remove(struct hid_device *hdev)
 {
 	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
 
-	if (msc)
+	if (msc) {
 		cancel_delayed_work_sync(&msc->work);
+		if (msc->vib_down)
+			kfree(msc->vib_down);
+		if (msc->vib_up)
+			kfree(msc->vib_up);
+	}
 
 	hid_hw_stop(hdev);
 }
