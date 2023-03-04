@@ -19,7 +19,7 @@ By default, it works the same as before. To change click pressure, it need to ge
     sudo modprobe -r hid_magicmouse
     sudo modprobe hid-magicmouse host_click=on button_down_param=0x503f0606 button_up_param=0x35110404
 
-The first byte means the pressure to trigger the button. And three lasest bytes means how the trackpad vibrates. Set latest two bytes 0x00 to get silent mode
+The first byte means the pressure to trigger the button. And three latest bytes means how the trackpad vibrates. Set latest two bytes 0x00 to get silent mode
 
 By default when `host_click=on`, button_down_param=0x40170606 button_up_param=0x26140000, which is the same as medium pressure on macOS
 
